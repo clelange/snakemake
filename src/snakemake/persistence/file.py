@@ -7,13 +7,17 @@ import os
 import shutil
 import json
 import stat
+import tempfile
 from base64 import urlsafe_b64encode
 from functools import lru_cache
 from itertools import count
 from pathlib import Path
 from typing import Iterable
 
-from snakemake.persistence import PersistenceBase, MetadataRecord
+from pydantic import ValidationError
+from snakemake_interface_common.exceptions import WorkflowError
+
+from snakemake.persistence import DetachedRunRecord, PersistenceBase, MetadataRecord
 from snakemake.utils import listfiles
 from snakemake.logging import logger
 
@@ -47,6 +51,7 @@ class FilePersistence(PersistenceBase):
 
         self._metadata_path = os.path.join(self.path, "metadata")
         self._incomplete_path = os.path.join(self.path, "incomplete")
+        self._detached_run_path = os.path.join(self.path, "detached-run.json")
 
         migration_indicator = Path(
             os.path.join(self._incomplete_path, "migration_underway")
@@ -225,6 +230,67 @@ class FilePersistence(PersistenceBase):
             if "external_jobid" in rec and rec["external_jobid"] is not None:
                 jobids.add(rec["external_jobid"])
         return jobids
+
+    def _read_detached_run(self) -> DetachedRunRecord | None:
+        if not os.path.exists(self._detached_run_path):
+            return None
+        try:
+            with open(self._detached_run_path, "r") as f:
+                rec = json.load(f)
+            return DetachedRunRecord.model_validate(rec)
+        except (json.JSONDecodeError, ValidationError) as e:
+            raise WorkflowError(
+                f"Detached-run record {self._detached_run_path} is corrupted. "
+                "Remove it only after verifying that no detached jobs are still "
+                "running."
+            ) from e
+
+    def _create_detached_run(self, record: DetachedRunRecord) -> None:
+        mode = stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP
+        try:
+            fd = os.open(
+                self._detached_run_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                mode,
+            )
+        except FileExistsError as e:
+            raise WorkflowError(
+                "A detached Snakemake execution is already registered for this "
+                "workflow directory."
+            ) from e
+        with os.fdopen(fd, "w") as f:
+            json.dump(record.model_dump(mode="json"), f)
+
+    def _write_detached_run(self, record: DetachedRunRecord) -> None:
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=self.path,
+                prefix=".detached-run.",
+                delete=False,
+            ) as f:
+                temp_path = f.name
+                json.dump(record.model_dump(mode="json"), f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(
+                temp_path,
+                stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP,
+            )
+            os.replace(temp_path, self._detached_run_path)
+        finally:
+            if temp_path is not None and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def _delete_detached_run(self) -> bool:
+        try:
+            os.remove(self._detached_run_path)
+            return True
+        except OSError as e:
+            if e.errno != 2:
+                raise e
+            return False
 
     def _read_locks(self) -> Iterable[tuple[str, str]]:
         for lock_type in ["input", "output"]:

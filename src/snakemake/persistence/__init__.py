@@ -7,6 +7,7 @@ from abc import abstractmethod
 from base64 import b64encode
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import (
@@ -31,6 +32,18 @@ import snakemake.exceptions
 
 RECORD_FORMAT_VERSION = 6
 UNREPRESENTABLE = object()
+
+
+class DetachedRunState(StrEnum):
+    DETACHING = "detaching"
+    DETACHED = "detached"
+    FAILED = "failed"
+
+
+ACTIVE_DETACHED_RUN_STATES = {
+    DetachedRunState.DETACHING,
+    DetachedRunState.DETACHED,
+}
 
 
 class MetadataRecord(SQLModel):
@@ -67,6 +80,15 @@ class MetadataRecord(SQLModel):
 
     def items(self):
         return self.model_dump().items()
+
+
+class DetachedRunRecord(SQLModel):
+    state: DetachedRunState = DetachedRunState.DETACHING
+    created_at: float
+    updated_at: float
+    executor: str
+    namespace: str
+    message: str | None = None
 
 
 @dataclass
@@ -436,9 +458,91 @@ class PersistenceBase(
         """
         ...
 
+    @abstractmethod
+    def _read_detached_run(self) -> DetachedRunRecord | None:
+        """Read the active detached-run record, if present."""
+        ...
+
+    @abstractmethod
+    def _create_detached_run(self, record: DetachedRunRecord) -> None:
+        """Create a detached-run record without replacing an existing record."""
+        ...
+
+    @abstractmethod
+    def _write_detached_run(self, record: DetachedRunRecord) -> None:
+        """Replace an existing detached-run record."""
+        ...
+
+    @abstractmethod
+    def _delete_detached_run(self) -> bool:
+        """Delete the active detached-run record, if present."""
+        ...
+
     def _get_key(self, f: _IOFile) -> str:
         assert isinstance(f, _IOFile)
         return str(f.storage_object.query if f.is_storage else f)
+
+    @property
+    def namespace(self) -> str:
+        return str(self.path.absolute())
+
+    def detached_run(self) -> DetachedRunRecord | None:
+        record = self._read_detached_run()
+        if record is not None and record.namespace != self.namespace:
+            raise WorkflowError(
+                "Detached Snakemake execution belongs to persistence namespace "
+                f"{record.namespace!r}, not {self.namespace!r}."
+            )
+        return record
+
+    def begin_detached_run(
+        self, executor: str, message: str | None = None
+    ) -> DetachedRunRecord:
+        existing = self.detached_run()
+        if existing is not None:
+            if existing.state in ACTIVE_DETACHED_RUN_STATES:
+                raise WorkflowError(
+                    "A detached Snakemake execution is already registered for this "
+                    f"workflow directory with executor {existing.executor!r}."
+                )
+            self._delete_detached_run()
+
+        now = time.time()
+        record = DetachedRunRecord(
+            created_at=now,
+            updated_at=now,
+            executor=executor,
+            namespace=self.namespace,
+            message=message,
+        )
+        self._create_detached_run(record)
+        return record
+
+    def transition_detached_run(
+        self,
+        state: DetachedRunState,
+        message: str | None = None,
+        expected_state: DetachedRunState | None = None,
+    ) -> DetachedRunRecord:
+        record = self.detached_run()
+        if record is None:
+            raise WorkflowError(
+                "No detached Snakemake execution is registered for this workflow "
+                "directory."
+            )
+        if expected_state is not None and record.state is not expected_state:
+            raise WorkflowError(
+                "Cannot transition detached Snakemake execution from state "
+                f"{record.state.value!r}; expected {expected_state.value!r}."
+            )
+        record.state = state
+        record.updated_at = time.time()
+        record.message = message
+        self._write_detached_run(record)
+        return record
+
+    def delete_detached_run(self) -> bool:
+        return self._delete_detached_run()
 
     def metadata(self, target: Any) -> MetadataRecord | None:
         return self._read_record(self._get_key(target))

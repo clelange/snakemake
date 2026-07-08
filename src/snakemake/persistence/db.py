@@ -17,7 +17,9 @@ from sqlalchemy.orm import DeclarativeBase, Session
 from sqlmodel import SQLModel, Field
 import sqlite3
 
-from snakemake.persistence import MetadataRecord, PersistenceBase
+from snakemake_interface_common.exceptions import WorkflowError
+
+from snakemake.persistence import DetachedRunRecord, MetadataRecord, PersistenceBase
 from snakemake.logging import logger
 import snakemake.exceptions
 
@@ -45,6 +47,11 @@ class LockORM(SQLModel, table=True):
     lock_type: str = Field(primary_key=True)
 
 
+class DetachedRunRecordORM(DetachedRunRecord, table=True):
+    __tablename__ = "snakemake_detached_runs"
+    namespace: str = Field(primary_key=True)
+
+
 class DbPersistence(PersistenceBase):
     def __init__(
         self,
@@ -66,10 +73,6 @@ class DbPersistence(PersistenceBase):
             warn_only=warn_only,
             path=path,
         )
-
-        # use the absolute workdir path as a namespace
-        # to allow using the same db for multiple different Snakemake instances running in different directories
-        self.namespace = str(self.path.absolute())
 
         # using custom LRU to be able to clear specific keys only, see https://stackoverflow.com/a/52101715
         self._metadata_cache = OrderedDict()
@@ -268,6 +271,43 @@ class DbPersistence(PersistenceBase):
                 )
                 result.update(session.scalars(stmt).all())
         return result
+
+    def _read_detached_run(self) -> DetachedRunRecord | None:
+        with Session(self.engine) as session:
+            record = session.get(DetachedRunRecordORM, self.namespace)
+            return DetachedRunRecord.model_validate(record) if record else None
+
+    def _create_detached_run(self, record: DetachedRunRecord) -> None:
+        with Session(self.engine) as session:
+            session.add(DetachedRunRecordORM(**record.model_dump()))
+            try:
+                session.commit()
+            except IntegrityError as e:
+                session.rollback()
+                raise WorkflowError(
+                    "A detached Snakemake execution is already registered for this "
+                    "workflow directory."
+                ) from e
+
+    def _write_detached_run(self, record: DetachedRunRecord) -> None:
+        with Session(self.engine) as session:
+            orm_record = session.get(DetachedRunRecordORM, self.namespace)
+            if orm_record is None:
+                raise WorkflowError(
+                    "No detached Snakemake execution is registered for this "
+                    "workflow directory."
+                )
+            orm_record.sqlmodel_update(record)
+            session.add(orm_record)
+            session.commit()
+
+    def _delete_detached_run(self) -> bool:
+        with Session(self.engine) as session:
+            if record := session.get(DetachedRunRecordORM, self.namespace):
+                session.delete(record)
+                session.commit()
+                return True
+        return False
 
     def _read_locks(self) -> Iterable[tuple[str, str]]:
         with Session(self.engine) as session:
