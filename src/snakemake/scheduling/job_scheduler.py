@@ -9,6 +9,7 @@ import asyncio
 from bisect import bisect
 from collections import defaultdict, deque
 import copy
+from enum import Enum
 import math
 import os, signal, sys
 import threading
@@ -53,6 +54,12 @@ _ERROR_MSG_ISSUE_823 = (
     "BUG: Out of jobs ready to be started, but not all files built yet."
     " Please check https://github.com/snakemake/snakemake/issues/823 for more information."
 )
+
+
+class ScheduleResult(Enum):
+    SUCCESS = "success"
+    FAILED = "failed"
+    DETACHED = "detached"
 
 
 class DummyRateLimiter(ContextDecorator):
@@ -217,7 +224,7 @@ class JobScheduler(JobSchedulerExecutorInterface):
             for path in list(filterfalse(paths.__contains__, self._input_sizes)):
                 del self._input_sizes[path]
 
-    def schedule(self):
+    def schedule(self) -> ScheduleResult:
         """Schedule jobs that are ready, maximizing cpu usage."""
         try:
             while True:
@@ -255,7 +262,7 @@ class JobScheduler(JobSchedulerExecutorInterface):
                             logger.error(_ERROR_MSG_FINAL)
                             for job in self.failed:
                                 job.log_error()
-                        return False
+                        return ScheduleResult.FAILED
                     continue
 
                 # all runnable jobs have finished, normal shutdown
@@ -283,8 +290,8 @@ class JobScheduler(JobSchedulerExecutorInterface):
                                 for job in self.remaining_jobs
                             )
                         )
-                        return False
-                    return not errors
+                        return ScheduleResult.FAILED
+                    return ScheduleResult.FAILED if errors else ScheduleResult.SUCCESS
 
                 # continue if no new job needs to be executed
                 if not needrun:
@@ -405,7 +412,7 @@ class JobScheduler(JobSchedulerExecutorInterface):
                 "Terminating processes on user request, this might take some time."
             )
             self._executor.cancel()
-            return False
+            return ScheduleResult.FAILED
         except Exception as e:
             # Other exceptions should cause the executor to cancel the jobs
             # as well, so that no unmanaged jobs remain.

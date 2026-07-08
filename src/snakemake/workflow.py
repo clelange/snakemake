@@ -84,7 +84,7 @@ from snakemake.exceptions import (
     update_lineno,
 )
 from snakemake.dag import DAG, ChangeType
-from snakemake.scheduling.job_scheduler import JobScheduler
+from snakemake.scheduling.job_scheduler import JobScheduler, ScheduleResult
 from snakemake.parser import parse
 import snakemake.io
 from snakemake.io import (
@@ -1500,7 +1500,7 @@ class Workflow(WorkflowExecutorInterface):
             has_checkpoint_jobs = any(self.dag.checkpoint_jobs)
 
             try:
-                success = self.scheduler.schedule()
+                schedule_result = self.scheduler.schedule()
             except Exception as e:
                 if self.dryrun:
                     self.log_provenance_info()
@@ -1521,7 +1521,9 @@ class Workflow(WorkflowExecutorInterface):
                 if not self.storage_settings.keep_storage_local:
                     self.async_run(self.dag.cleanup_storage_objects())
 
-            if success:
+            if schedule_result is ScheduleResult.DETACHED:
+                return
+            if schedule_result is ScheduleResult.SUCCESS:
                 if self.dryrun:
                     if len(self.dag):
                         stats_msg, stats_dict = self.dag.stats()
