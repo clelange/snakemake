@@ -30,9 +30,11 @@ from snakemake_interface_scheduler_plugins.base import SchedulerBase
 from snakemake_interface_scheduler_plugins.registry import SchedulerPluginRegistry
 
 from snakemake.exceptions import RuleException, WorkflowError, print_exception
+from snakemake.executors.detach import supports_detach_attach
 from snakemake.logging import logger
 from snakemake.scheduling.greedy import SchedulerSettings as GreedySchedulerSettings
 
+from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake.settings.enums import Quietness
 from snakemake.settings.types import MaxJobsPerTimespan, SharedFSUsage
 
@@ -54,6 +56,10 @@ _ERROR_MSG_ISSUE_823 = (
     "BUG: Out of jobs ready to be started, but not all files built yet."
     " Please check https://github.com/snakemake/snakemake/issues/823 for more information."
 )
+
+
+class AttachSetupError(WorkflowError):
+    pass
 
 
 class ScheduleResult(Enum):
@@ -163,6 +169,15 @@ class JobScheduler(JobSchedulerExecutorInterface):
                 )
             )
 
+        if (
+            self.workflow.execution_settings.detach
+            or self.workflow.execution_settings.attach
+        ) and not supports_detach_attach(self._executor):
+            raise WorkflowError(
+                f"Executor {self.workflow.executor_plugin.name!r} does not support "
+                "experimental detach/attach."
+            )
+
         self._greedy_scheduler = (
             SchedulerPluginRegistry()
             .get_plugin("greedy")
@@ -227,6 +242,16 @@ class JobScheduler(JobSchedulerExecutorInterface):
     def schedule(self) -> ScheduleResult:
         """Schedule jobs that are ready, maximizing cpu usage."""
         try:
+            if self.workflow.execution_settings.attach:
+                try:
+                    self._attach_incomplete_jobs()
+                except Exception as e:
+                    self._executor.detach()
+                    raise AttachSetupError(
+                        "Failed to attach all persisted external jobs. Existing "
+                        "jobs were left running and can be attached again."
+                    ) from e
+
             while True:
                 if self.workflow.dag.queue_input_jobs:
                     self.update_queue_input_jobs()
@@ -240,6 +265,8 @@ class JobScheduler(JobSchedulerExecutorInterface):
                     self._finish_jobs()
                     self._error_jobs()
                     needrun = set(self.open_jobs)
+                    if self.workflow.execution_settings.detach:
+                        needrun = {job for job in needrun if not job.is_local}
                     running = list(self.running)
                     errors = self._errors
                     executor_error = self._executor_error
@@ -397,6 +424,27 @@ class JobScheduler(JobSchedulerExecutorInterface):
                             )
                         self.run(runjobs)
 
+                        if self.workflow.execution_settings.detach:
+                            missing_jobids = [
+                                job
+                                for job in runjobs
+                                if self.workflow.dag.incomplete_external_jobid(
+                                    job, ignore_force_incomplete=True
+                                )
+                                is None
+                            ]
+                            if missing_jobids:
+                                raise WorkflowError(
+                                    "Cannot detach because the executor did not "
+                                    "persist external job IDs for all submitted jobs."
+                                )
+                            self._executor.detach()
+                            logger.info(
+                                "Detached Snakemake execution. Submitted jobs will "
+                                "continue running."
+                            )
+                            return ScheduleResult.DETACHED
+
                 if not self.dryrun:
                     if self._run_performed is None or self._run_performed:
                         if self.running:
@@ -407,6 +455,8 @@ class JobScheduler(JobSchedulerExecutorInterface):
                         # need to reevaluate because after the timespan we can
                         # schedule more jobs again
                         self._schedule_reevalutation(self.job_rate_limiter.timespan)
+        except AttachSetupError:
+            raise
         except (KeyboardInterrupt, SystemExit):
             logger.info(
                 "Terminating processes on user request, this might take some time."
@@ -418,6 +468,40 @@ class JobScheduler(JobSchedulerExecutorInterface):
             # as well, so that no unmanaged jobs remain.
             self._executor.cancel()
             raise e
+
+    def _attach_incomplete_jobs(self) -> None:
+        jobs_to_attach = []
+        for job, external_jobid in self.workflow.dag.incomplete_external_job_units():
+            if job.is_local:
+                raise WorkflowError(
+                    "--attach cannot preserve local jobs. Mark local rules as "
+                    "non-local or run without --attach."
+                )
+            executor = self._executor
+            attach_job = getattr(executor, "attach_job", None)
+            if attach_job is None:
+                raise WorkflowError(
+                    f"Executor {self.workflow.executor_plugin.name!r} does not "
+                    "support experimental attach."
+                )
+            jobs_to_attach.append((job, external_jobid, attach_job))
+
+        if not jobs_to_attach:
+            return
+
+        with self._lock:
+            jobs = {job for job, _, _ in jobs_to_attach}
+            self.running.update(jobs)
+            self.workflow.dag.register_running(jobs)
+            self.update_available_resources(jobs)
+
+        for job, external_jobid, attach_job in jobs_to_attach:
+            logger.info(
+                "Attaching to job {} with external jobid '{}'.".format(
+                    job.jobid, external_jobid
+                )
+            )
+            attach_job(SubmittedJobInfo(job=job, external_jobid=external_jobid))
 
     def _schedule_reevalutation(self, delay: int) -> None:
         threading.Timer(

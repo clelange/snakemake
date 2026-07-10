@@ -57,6 +57,7 @@ from snakemake_interface_scheduler_plugins.registry import SchedulerPluginRegist
 
 from snakemake.workflow import Workflow
 from snakemake.exceptions import print_exception
+from snakemake.executors.detach import supports_detach_attach
 from snakemake.logging import LoggerManager, logger
 from snakemake.shell import shell
 from snakemake.common import (
@@ -512,8 +513,39 @@ class DAGApi(ApiBase):
         executor_plugin_registry = ExecutorPluginRegistry()
         executor_plugin = executor_plugin_registry.get_plugin(executor)
 
+        if execution_settings.detach and execution_settings.attach:
+            raise ApiError("detach and attach cannot be used at the same time")
+
         if executor_settings is not None:
             executor_plugin.validate_settings(executor_settings)
+
+        if execution_settings.detach or execution_settings.attach:
+            logger.warning(
+                "--detach/--attach are experimental and may change in a future "
+                "Snakemake release."
+            )
+            if executor_plugin.common_settings.local_exec:
+                raise ApiError(
+                    "--detach/--attach currently require a non-local executor."
+                )
+            if remote_execution_settings.immediate_submit:
+                raise ApiError(
+                    "--detach/--attach are not supported together with "
+                    "--immediate-submit."
+                )
+            if not execution_settings.lock:
+                raise ApiError("--detach/--attach require workflow directory locking.")
+            if execution_settings.ignore_incomplete:
+                raise ApiError(
+                    "--detach/--attach cannot be combined with --ignore-incomplete."
+                )
+            if execution_settings.attach and self.dag_settings.force_incomplete:
+                raise ApiError("--attach cannot be combined with --rerun-incomplete.")
+            if not supports_detach_attach(executor_plugin.executor):
+                raise ApiError(
+                    f"Executor {executor!r} does not support experimental "
+                    "detach/attach."
+                )
 
         if executor_plugin.common_settings.implies_no_shared_fs:
             # no shared FS at all

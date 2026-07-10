@@ -32,6 +32,7 @@ def test_scheduler_returns_explicit_result(has_errors, expected):
     scheduler = JobScheduler.__new__(JobScheduler)
     scheduler.workflow = SimpleNamespace(
         dag=dag,
+        execution_settings=SimpleNamespace(attach=False, detach=False),
         remote_execution_settings=SimpleNamespace(immediate_submit=False),
     )
     scheduler._open_jobs = threading.Semaphore(1)

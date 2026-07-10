@@ -125,6 +125,8 @@ class ExecutionSettings(SettingsBase, ExecutionSettingsExecutorInterface):
     edit_notebook: Optional[NotebookEditMode] = None
     cleanup_scripts: bool = True
     queue_input_wait_time: int = 10
+    detach: bool = False
+    attach: bool = False
 
 
 @dataclass

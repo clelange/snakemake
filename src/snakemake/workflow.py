@@ -84,7 +84,11 @@ from snakemake.exceptions import (
     update_lineno,
 )
 from snakemake.dag import DAG, ChangeType
-from snakemake.scheduling.job_scheduler import JobScheduler, ScheduleResult
+from snakemake.scheduling.job_scheduler import (
+    AttachSetupError,
+    JobScheduler,
+    ScheduleResult,
+)
 from snakemake.parser import parse
 import snakemake.io
 from snakemake.io import (
@@ -110,7 +114,11 @@ from snakemake.io import (
     sourcecache_entry,
 )
 
-from snakemake.persistence import PersistenceBase
+from snakemake.persistence import (
+    ACTIVE_DETACHED_RUN_STATES,
+    DetachedRunState,
+    PersistenceBase,
+)
 from snakemake.utils import update_config
 from snakemake.script import script
 from snakemake.notebook import notebook
@@ -1387,6 +1395,54 @@ class Workflow(WorkflowExecutorInterface):
             logger.debug(f"remote_exec: {self.remote_exec}")
             dryrun_or_touch = self.dryrun or self.touch
 
+            detached_run = None
+            if self.execution_settings.attach:
+                detached_run = self.persistence.detached_run()
+                if detached_run is None:
+                    raise WorkflowError(
+                        "No detached Snakemake execution is registered for this "
+                        "workflow directory."
+                    )
+                if detached_run.state is DetachedRunState.FAILED:
+                    detail = (
+                        f": {detached_run.message}" if detached_run.message else "."
+                    )
+                    raise WorkflowError(
+                        "Detached Snakemake execution has already failed" + detail
+                    )
+                if detached_run.executor != executor_plugin.name:
+                    raise WorkflowError(
+                        "Detached Snakemake execution was created with executor "
+                        f"{detached_run.executor!r}, but current executor is "
+                        f"{executor_plugin.name!r}."
+                    )
+                attachable_units = list(self.dag.incomplete_external_job_units())
+                if (
+                    detached_run.state is DetachedRunState.DETACHED
+                    and not attachable_units
+                ):
+                    raise WorkflowError(
+                        "Detached Snakemake execution has no matching persisted "
+                        "external jobs in the current DAG. Use the same targets and "
+                        "configuration that were used for --detach."
+                    )
+
+            if self.execution_settings.detach:
+                existing = self.persistence.detached_run()
+                if (
+                    existing is not None
+                    and existing.state in ACTIVE_DETACHED_RUN_STATES
+                ):
+                    raise WorkflowError(
+                        "A detached Snakemake execution is already registered for "
+                        "this workflow directory."
+                    )
+                if not any(not job.is_local for job in self.dag.ready_jobs):
+                    raise WorkflowError(
+                        "No runnable non-local jobs are available to detach. Run "
+                        "without --detach until non-local work is ready."
+                    )
+
             should_deploy_sources = (
                 SharedFSUsage.SOURCES not in self.storage_settings.shared_fs_usage
                 and self.exec_mode == ExecMode.DEFAULT
@@ -1398,6 +1454,12 @@ class Workflow(WorkflowExecutorInterface):
             if should_deploy_sources:
                 # no shared FS, hence we have to upload the sources to the storage
                 self.upload_sources()
+
+            if self.execution_settings.detach:
+                self.persistence.begin_detached_run(
+                    executor=executor_plugin.name,
+                    message="Preparing to submit non-local jobs.",
+                )
 
             self.scheduler = JobScheduler(
                 self,
@@ -1476,7 +1538,8 @@ class Workflow(WorkflowExecutorInterface):
                         )
                 else:
                     logger.info(NOTHING_TO_BE_DONE_MSG)
-                    return
+                    if not self.execution_settings.attach:
+                        return
             else:
                 # the dryrun case
                 if len(self.dag):
@@ -1499,15 +1562,59 @@ class Workflow(WorkflowExecutorInterface):
 
             has_checkpoint_jobs = any(self.dag.checkpoint_jobs)
 
+            schedule_result = None
+            preserve_source_archive = False
             try:
                 schedule_result = self.scheduler.schedule()
+                if self.execution_settings.detach:
+                    if schedule_result is ScheduleResult.DETACHED:
+                        self.persistence.transition_detached_run(
+                            DetachedRunState.DETACHED,
+                            message=(
+                                f"Detached with {len(self.scheduler.running)} "
+                                "running job(s)."
+                            ),
+                            expected_state=DetachedRunState.DETACHING,
+                        )
+                    elif schedule_result is ScheduleResult.FAILED:
+                        self.persistence.transition_detached_run(
+                            DetachedRunState.FAILED,
+                            message="Detach failed and submitted jobs were cancelled.",
+                            expected_state=DetachedRunState.DETACHING,
+                        )
+                elif self.execution_settings.attach:
+                    if schedule_result is ScheduleResult.SUCCESS:
+                        self.persistence.delete_detached_run()
+                    elif schedule_result is ScheduleResult.FAILED:
+                        self.persistence.transition_detached_run(
+                            DetachedRunState.FAILED,
+                            message="An attached external job failed.",
+                        )
             except Exception as e:
+                preserve_source_archive = isinstance(e, AttachSetupError)
                 if self.dryrun:
                     self.log_provenance_info()
+                if self.execution_settings.detach or self.execution_settings.attach:
+                    record = self.persistence.detached_run()
+                    if (
+                        record is not None
+                        and record.state in ACTIVE_DETACHED_RUN_STATES
+                    ):
+                        self.persistence.transition_detached_run(
+                            record.state,
+                            message=f"Controller exited with error: {e}",
+                        )
                 raise e
             finally:
-                if should_deploy_sources:
+                if (
+                    should_deploy_sources
+                    and schedule_result is not ScheduleResult.DETACHED
+                    and not preserve_source_archive
+                ):
                     self.cleanup_source_archive()
+
+            if schedule_result is ScheduleResult.DETACHED:
+                return
 
             if (
                 not self.remote_execution_settings.immediate_submit
@@ -1521,8 +1628,6 @@ class Workflow(WorkflowExecutorInterface):
                 if not self.storage_settings.keep_storage_local:
                     self.async_run(self.dag.cleanup_storage_objects())
 
-            if schedule_result is ScheduleResult.DETACHED:
-                return
             if schedule_result is ScheduleResult.SUCCESS:
                 if self.dryrun:
                     if len(self.dag):

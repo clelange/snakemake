@@ -581,24 +581,51 @@ class DAG(DAGExecutorInterface, DAGReportInterface, DAGSchedulerInterface):
         """Check if any output files are incomplete. This is done by looking up
         markers in the persistence module."""
         if not self.ignore_incomplete:
-            incomplete_files = await self.incomplete_files()
+            execution_settings = self.workflow.execution_settings
+            attach = execution_settings is not None and execution_settings.attach
+            incomplete_files = []
+            for job in filterfalse(self.needrun, self.jobs):
+                job_incomplete_files = [
+                    f
+                    for f in await self.workflow.persistence.incomplete(job)
+                    if f is not None
+                ]
+                if not job_incomplete_files:
+                    continue
+                if attach and self.incomplete_external_jobid(job) is not None:
+                    # Force adopted jobs back through normal postprocessing even if
+                    # their external execution already created the output files.
+                    self.forcefiles.update(job.output)
+                else:
+                    incomplete_files.extend(job_incomplete_files)
             if any(incomplete_files):
                 if self.workflow.dag_settings.force_incomplete:
                     self.forcefiles.update(incomplete_files)
                 else:
                     raise IncompleteFilesException(incomplete_files)
 
-    def incomplete_external_jobid(self, job) -> Optional[str]:
+    def incomplete_external_jobid(
+        self, job, ignore_force_incomplete: bool = False
+    ) -> Optional[str]:
         """Return the external jobid of the job if it is marked as incomplete.
 
         Returns None, if job is not incomplete, or if no external jobid has been
-        registered or if force_incomplete is True.
+        registered. Unless ignore_force_incomplete is true, also return None when
+        force_incomplete is enabled so that the job is resubmitted.
         """
-        if self.workflow.dag_settings.force_incomplete:
+        if self.workflow.dag_settings.force_incomplete and not ignore_force_incomplete:
             return None
-        jobids = self.workflow.persistence.external_jobids(job)
+        if job.is_group():
+            jobids = set(
+                chain.from_iterable(
+                    self.workflow.persistence.external_jobids(member)
+                    for member in job.jobs
+                )
+            )
+        else:
+            jobids = set(self.workflow.persistence.external_jobids(job))
         if len(jobids) == 1:
-            return jobids[0]
+            return next(iter(jobids))
         elif len(jobids) > 1:
             raise WorkflowError(
                 "Multiple different external jobids registered "
@@ -689,6 +716,16 @@ class DAG(DAGExecutorInterface, DAGReportInterface, DAGSchedulerInterface):
                 ]
             )
         return incomplete
+
+    def incomplete_external_job_units(self):
+        """Yield incomplete execution units and their persisted external IDs."""
+        for unit in self.get_jobs_or_groups():
+            members = unit.jobs if unit.is_group() else (unit,)
+            if not any(self.needrun(job) for job in members):
+                continue
+            external_jobid = self.incomplete_external_jobid(unit)
+            if external_jobid is not None:
+                yield unit, external_jobid
 
     @property
     def newversion_files(self):
