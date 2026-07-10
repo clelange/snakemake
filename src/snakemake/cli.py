@@ -1351,6 +1351,19 @@ def get_argument_parser(profiles=None):
         action="store_true",
         help="Do not check for incomplete output files.",
     )
+    group_detach_attach = group_behavior.add_mutually_exclusive_group()
+    group_detach_attach.add_argument(
+        "--detach",
+        action="store_true",
+        help="Experimental: submit currently runnable non-local jobs and exit without "
+        "cancelling them. A later invocation with --attach can resume control.",
+    )
+    group_detach_attach.add_argument(
+        "--attach",
+        action="store_true",
+        help="Experimental: resume control of a previously detached non-local "
+        "workflow execution in this working directory.",
+    )
     group_behavior.add_argument(
         "--max-inventory-time",
         type=int,
@@ -2328,6 +2341,8 @@ def args_to_api(args, parser):
                                 edit_notebook=edit_notebook,
                                 cleanup_scripts=not args.skip_script_cleanup,
                                 queue_input_wait_time=args.queue_input_wait_time,
+                                detach=args.detach,
+                                attach=args.attach,
                             ),
                             remote_execution_settings=RemoteExecutionSettings(
                                 jobname=args.jobname,
